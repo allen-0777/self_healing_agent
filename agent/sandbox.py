@@ -1,8 +1,6 @@
 """
 方向五：Python 執行沙盒
-------------------------
-在 execute_python 前用 AST 靜態分析攔截危險 import，
-並加上 timeout + 記憶體上限。
+O5  ：細化 allowlist（新增 csv，移除可寫入的 pathlib）
 """
 
 import ast
@@ -17,29 +15,37 @@ BLOCKED_MODULES = {
     "http", "urllib", "requests", "httpx", "ftplib",
     "smtplib", "pickle", "ctypes", "importlib",
     "builtins", "multiprocessing", "threading",
-    "signal", "pty", "atexit",
+    "signal", "pty", "atexit", "pathlib",  # pathlib has unlink/rmdir etc.
 }
 
-# 允許的標準庫白名單（其餘一律阻擋）
+# 允許的標準庫白名單
 ALLOWED_MODULES = {
-    "math", "statistics", "random", "decimal", "fractions",
-    "itertools", "functools", "collections", "heapq",
-    "json", "csv", "re", "string", "textwrap",
+    # 數學 / 統計
+    "math", "statistics", "random", "decimal", "fractions", "cmath",
+    # 迭代 / 函式
+    "itertools", "functools", "operator",
+    # 資料結構
+    "collections", "heapq", "bisect", "array",
+    # 字串 / 格式
+    "json", "csv", "re", "string", "textwrap", "unicodedata",
+    # 時間
     "datetime", "time", "calendar",
-    "pathlib",          # 唯讀 path 操作
+    # IO（記憶體層級，不能開檔）
     "io", "struct",
-    "pprint", "copy",
-    "enum", "dataclasses", "typing",
-    "abc", "contextlib",
-    # data science (safe)
+    # 工具
+    "pprint", "copy", "enum", "dataclasses", "typing",
+    "abc", "contextlib", "types",
+    # 資料科學（safe）
     "numpy", "pandas", "scipy", "sklearn",
     "matplotlib", "seaborn",
+    # 壓縮（唯讀）
+    "gzip", "zipfile",
 }
 
 # ── 資源上限 ─────────────────────────────────────────────────────────────────
-MAX_MEMORY_MB = 256
 MAX_CPU_SECONDS = 10
 MAX_OUTPUT_BYTES = 64 * 1024  # 64 KB
+MAX_MEMORY_MB = 256
 
 
 class SandboxViolation(Exception):
@@ -49,7 +55,7 @@ class SandboxViolation(Exception):
 def _check_ast(code: str) -> None:
     """
     Parse and walk the AST to block dangerous imports.
-    Raises SandboxViolation on policy breach.
+    Raises SandboxViolation on policy breach, SyntaxError on bad syntax.
     """
     try:
         tree = ast.parse(code)
@@ -57,24 +63,18 @@ def _check_ast(code: str) -> None:
         raise SyntaxError(str(e)) from e
 
     for node in ast.walk(tree):
-        # import X  /  import X as Y
         if isinstance(node, ast.Import):
             for alias in node.names:
-                top = alias.name.split(".")[0]
-                _assert_allowed(top)
+                _assert_allowed(alias.name.split(".")[0])
 
-        # from X import Y
         elif isinstance(node, ast.ImportFrom):
             if node.module:
-                top = node.module.split(".")[0]
-                _assert_allowed(top)
+                _assert_allowed(node.module.split(".")[0])
 
-        # __import__("os") style
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id == "__import__":
                 if node.args and isinstance(node.args[0], ast.Constant):
-                    top = str(node.args[0].value).split(".")[0]
-                    _assert_allowed(top)
+                    _assert_allowed(str(node.args[0].value).split(".")[0])
 
 
 def _assert_allowed(module_name: str) -> None:
@@ -82,23 +82,20 @@ def _assert_allowed(module_name: str) -> None:
         raise SandboxViolation(
             f"Blocked: import of '{module_name}' is not allowed in sandbox."
         )
-    # Modules not in the allow list are also blocked (strict whitelist)
     if module_name not in ALLOWED_MODULES:
         raise SandboxViolation(
             f"Blocked: '{module_name}' is not in the sandbox allow-list. "
-            f"Allowed: {sorted(ALLOWED_MODULES)}"
+            f"Allowed modules: {sorted(ALLOWED_MODULES)}"
         )
 
 
 def _set_limits() -> None:
-    """Called in subprocess before exec — sets CPU limit (memory via AS where supported)."""
+    """Called in subprocess preexec_fn — sets resource limits where supported."""
     try:
-        # CPU time (works on both Linux and macOS)
         resource.setrlimit(resource.RLIMIT_CPU, (MAX_CPU_SECONDS, MAX_CPU_SECONDS))
     except (ValueError, resource.error):
         pass
     try:
-        # Virtual memory limit — Linux only; silently skip on macOS
         mem_bytes = MAX_MEMORY_MB * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
     except (ValueError, resource.error):
@@ -109,32 +106,35 @@ def execute_python_sandboxed(code: str) -> str:
     """
     Execute Python code with:
       1. AST-based import analysis (pre-execution)
-      2. Resource limits (memory + CPU via preexec_fn)
-      3. Output size cap
-      4. Timeout via subprocess timeout
+      2. Resource limits (CPU + memory via preexec_fn on POSIX)
+      3. Output size cap (64 KB)
+      4. Subprocess timeout
     """
-    # Step 1: static analysis
     _check_ast(code)
 
-    # Step 2: write to temp file
     with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as tmp:
         tmp.write(code)
         tmp_path = tmp.name
 
     try:
-        # Step 3: run in subprocess with resource limits
-        use_limits = os.name == "posix"  # resource module is POSIX-only
         result = subprocess.run(
             ["python3", tmp_path],
             capture_output=True,
             text=True,
             timeout=MAX_CPU_SECONDS + 2,
-            preexec_fn=_set_limits if use_limits else None,
+            preexec_fn=_set_limits if os.name == "posix" else None,
         )
 
-        # Step 4: cap output size
         stdout = result.stdout[:MAX_OUTPUT_BYTES]
         stderr = result.stderr[:MAX_OUTPUT_BYTES]
+
+        if result.returncode < 0:
+            # Killed by signal (negative = signal number on POSIX)
+            import signal as _signal
+            sig = -result.returncode
+            if sig == _signal.SIGXCPU.value:
+                raise RuntimeError(f"Execution timed out (CPU limit exceeded).")
+            raise RuntimeError(f"Process killed by signal {sig}.")
 
         if result.returncode != 0:
             raise RuntimeError(
@@ -146,8 +146,6 @@ def execute_python_sandboxed(code: str) -> str:
         return stdout.strip() or "(no output)"
 
     except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"Execution timed out after {MAX_CPU_SECONDS} seconds."
-        )
+        raise RuntimeError(f"Execution timed out after {MAX_CPU_SECONDS} seconds.")
     finally:
         os.unlink(tmp_path)

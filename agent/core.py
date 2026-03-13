@@ -1,39 +1,18 @@
 """
-Self-Healing Agent Core  (v2 — all 5 optimisations)
-=====================================================
-
-方向一  Structured Reflection + Confidence Gate
-方向二  Escalating Reflection Depth
-方向三  Failure Memory Store  (skip reflection for known failures)
-方向四  Structured Logging + Run Report
-方向五  Python Sandbox  (AST analysis + resource limits)
-
-Flow
-----
-工具失敗
-  │
-  ├─► Memory hit?  ──YES──► 注入過去成功策略，跳過 reflection API
-  │
-  └─► NO
-       │
-       ├─► attempt 1 → Haiku (輕量反思)
-       ├─► attempt 2 → agent model (標準反思)
-       └─► attempt 3 → agent model + adaptive thinking (深度反思)
-              │
-              ├─► confidence < 35? → 放棄，不重試
-              └─► inject structured reflection → Claude 重試
-                       │
-                       └─► success → 記錄到 Memory Store
+Self-Healing Agent Core  (v3)
+==============================
+O1  Memory 儲存改為反思的 new_strategy（而非只記錄 input）
+O3  新增 max_turns 全局上限，防止無限迴圈
+O4  retry_counts 改以 tool_name 為 key（修正每次重試 ID 變動導致計數失效的 bug）
 """
 
 import json
-import time
 import uuid
 from dataclasses import dataclass, field
 
 import anthropic
 
-from .reflection import Reflector, LowConfidenceError
+from .reflection import Reflector, LowConfidenceError, ReflectionResult
 from .memory import FailureMemory
 from .logger import RunLogger, RunLog
 from .tools import ToolRegistry
@@ -76,10 +55,11 @@ class AgentRun:
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
 
+class MaxTurnsExceeded(Exception):
+    pass
+
+
 class SelfHealingAgent:
-    """
-    Agentic loop with automatic reflection, memory, logging, and sandbox.
-    """
 
     def __init__(
         self,
@@ -87,6 +67,7 @@ class SelfHealingAgent:
         model: str,
         tools: ToolRegistry,
         max_retries: int = 3,
+        max_turns: int = 30,      # O3: global turn limit
         verbose: bool = True,
         enable_memory: bool = True,
         enable_sandbox: bool = True,
@@ -96,10 +77,10 @@ class SelfHealingAgent:
         self.model = model
         self.tools = tools
         self.max_retries = max_retries
+        self.max_turns = max_turns
         self.verbose = verbose
         self.print_report = print_report
         self.enable_sandbox = enable_sandbox
-
         self.reflector = Reflector(client, model)
         self.memory = FailureMemory() if enable_memory else None
 
@@ -115,12 +96,26 @@ class SelfHealingAgent:
 
         messages: list[dict] = [{"role": "user", "content": task}]
         agent_run = AgentRun(task=task, final_answer="")
+
+        # O4: keyed by tool_name (not tool_use_id) so retries across turns are counted
         retry_counts: dict[str, int] = {}
-        # Remember which tool_id → error_msg for post-success memory recording
-        pending_errors: dict[str, tuple[str, dict]] = {}
+
+        # O1: track last reflection strategy per tool_name for memory recording
+        # {tool_name: (error_msg, new_strategy)}
+        pending_reflections: dict[str, tuple[str, list[str]]] = {}
+
+        turn = 0
 
         try:
             while True:
+                # O3: global turn guard
+                turn += 1
+                if turn > self.max_turns:
+                    raise MaxTurnsExceeded(
+                        f"Reached max_turns={self.max_turns}. "
+                        "Task did not complete in time."
+                    )
+
                 response = self.client.messages.create(
                     model=self.model,
                     max_tokens=4096,
@@ -154,38 +149,32 @@ class SelfHealingAgent:
                         if block.type != "tool_use":
                             continue
 
-                        tool_id   = block.id
-                        tool_name = block.name
+                        tool_id    = block.id
+                        tool_name  = block.name
                         tool_input = block.input
-                        attempt_no = retry_counts.get(tool_id, 0) + 1
+
+                        # O4: use tool_name as key instead of tool_use_id
+                        attempt_no = retry_counts.get(tool_name, 0) + 1
 
                         self._print(f"[TOOL] {tool_name}({json.dumps(tool_input)})")
                         logger.tool_start()
 
-                        # ── Apply sandbox to execute_python ──────────────────
-                        effective_input = dict(tool_input)
-                        if self.enable_sandbox and tool_name == "execute_python":
-                            effective_input = {"code": tool_input.get("code", "")}
-
                         try:
-                            result = self._execute(tool_name, effective_input)
+                            result = self._execute(tool_name, tool_input)
 
-                            # On success after a previous failure → save to memory
-                            if tool_id in pending_errors and self.memory:
-                                prev_error, prev_input = pending_errors.pop(tool_id)
-                                # The strategy that worked was the last reflection's
-                                # new_strategy; we store tool_input as the "what worked"
+                            # O1: on success after a prior failure, record the
+                            #     actual reflection strategy (not just input)
+                            if tool_name in pending_reflections and self.memory:
+                                prev_error, prev_strategy = pending_reflections.pop(tool_name)
                                 self.memory.record(
                                     tool_name=tool_name,
                                     error_msg=prev_error,
-                                    successful_strategy=[
-                                        f"Used input: {json.dumps(effective_input)}"
-                                    ],
+                                    successful_strategy=prev_strategy,
                                 )
 
                             self._print("  ✅ Success")
-                            retry_counts[tool_id] = 0
-                            logger.tool_success(tool_name, effective_input)
+                            retry_counts[tool_name] = 0  # reset on success
+                            logger.tool_success(tool_name, tool_input)
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tool_id,
@@ -196,10 +185,9 @@ class SelfHealingAgent:
                             error_msg = str(exc)
                             self._print(f"  ❌ FAILED (attempt {attempt_no}): {error_msg[:120]}")
 
-                            # Max retries guard
                             if attempt_no > self.max_retries:
                                 self._print(f"  💀 Max retries reached — giving up.")
-                                logger.tool_failure(tool_name, effective_input, error_msg)
+                                logger.tool_failure(tool_name, tool_input, error_msg)
                                 tool_results.append({
                                     "type": "tool_result",
                                     "tool_use_id": tool_id,
@@ -211,16 +199,19 @@ class SelfHealingAgent:
                                 })
                                 continue
 
-                            pending_errors[tool_id] = (error_msg, dict(tool_input))
-                            retry_counts[tool_id] = attempt_no
+                            # O4: increment by tool_name
+                            retry_counts[tool_name] = attempt_no
 
-                            # ── 方向三: Memory lookup ──────────────────────
-                            mem_entry = self.memory.lookup(tool_name, error_msg) if self.memory else None
+                            # ── Memory lookup ─────────────────────────────────
+                            mem_entry = (
+                                self.memory.lookup(tool_name, error_msg)
+                                if self.memory else None
+                            )
 
                             if mem_entry:
                                 self._print(
-                                    f"  💾 Memory hit! Reusing past strategy "
-                                    f"(seen {mem_entry.hit_count}x)"
+                                    f"  💾 Memory hit! "
+                                    f"Reusing past strategy (seen {mem_entry.hit_count}x)"
                                 )
                                 strategy_text = "\n".join(
                                     f"  {i+1}. {s}"
@@ -233,32 +224,37 @@ class SelfHealingAgent:
                                     "Apply this strategy now."
                                 )
                                 logger.tool_failure(
-                                    tool_name, effective_input, error_msg,
-                                    reflection_depth=0, from_memory=True
+                                    tool_name, tool_input, error_msg,
+                                    reflection_depth=0, from_memory=True,
                                 )
                                 agent_run.memory_hits += 1
-                                agent_run.tool_attempts.append(
-                                    ToolAttempt(
-                                        tool_name=tool_name,
-                                        tool_input=effective_input,
-                                        error=error_msg,
-                                        reflection=strategy_text,
-                                        from_memory=True,
-                                    )
-                                )
+                                agent_run.tool_attempts.append(ToolAttempt(
+                                    tool_name=tool_name,
+                                    tool_input=tool_input,
+                                    error=error_msg,
+                                    reflection=strategy_text,
+                                    from_memory=True,
+                                ))
+
                             else:
-                                # ── 方向一+二: Structured reflection ─────────
+                                # ── Structured reflection ─────────────────────
                                 self._print(f"  🔍 Reflecting (depth={attempt_no})...")
                                 try:
-                                    reflection = self.reflector.reflect(
+                                    reflection: ReflectionResult = self.reflector.reflect(
                                         tool_name=tool_name,
-                                        tool_input=effective_input,
+                                        tool_input=tool_input,
                                         error_message=error_msg,
                                         task=task,
                                         attempt_number=attempt_no,
                                     )
                                     reflection_text = self.reflector.format_for_injection(reflection)
                                     self._print(f"\n  [REFLECTION]\n{reflection_text}\n")
+
+                                    # O1: store new_strategy for memory recording on success
+                                    pending_reflections[tool_name] = (
+                                        error_msg,
+                                        reflection.new_strategy,
+                                    )
 
                                     injection = (
                                         f"ERROR: {error_msg}\n\n"
@@ -267,29 +263,26 @@ class SelfHealingAgent:
                                         "Adjust your strategy based on the reflection above."
                                     )
                                     logger.tool_failure(
-                                        tool_name, effective_input, error_msg,
-                                        reflection_depth=attempt_no
+                                        tool_name, tool_input, error_msg,
+                                        reflection_depth=attempt_no,
                                     )
                                     agent_run.total_reflections += 1
-                                    agent_run.tool_attempts.append(
-                                        ToolAttempt(
-                                            tool_name=tool_name,
-                                            tool_input=effective_input,
-                                            error=error_msg,
-                                            reflection=reflection_text,
-                                        )
-                                    )
+                                    agent_run.tool_attempts.append(ToolAttempt(
+                                        tool_name=tool_name,
+                                        tool_input=tool_input,
+                                        error=error_msg,
+                                        reflection=reflection_text,
+                                    ))
 
                                 except LowConfidenceError as lce:
-                                    # 方向一: Confidence gate — abort early
                                     self._print(
-                                        f"  🚫 Confidence gate triggered "
-                                        f"({lce.reflection.confidence}/100 < threshold). "
-                                        "Aborting this tool."
+                                        f"  🚫 Confidence gate "
+                                        f"({lce.reflection.confidence}/100 < {35}). "
+                                        "Aborting."
                                     )
                                     logger.tool_failure(
-                                        tool_name, effective_input, error_msg,
-                                        reflection_depth=attempt_no
+                                        tool_name, tool_input, error_msg,
+                                        reflection_depth=attempt_no,
                                     )
                                     injection = (
                                         f"FATAL: Tool '{tool_name}' failed and reflection "
@@ -307,6 +300,15 @@ class SelfHealingAgent:
 
                     messages.append({"role": "user", "content": tool_results})
 
+        except MaxTurnsExceeded as e:
+            self._print(f"\n⏹  {e}")
+            agent_run.final_answer = str(e)
+            log = logger.finish(success=False, final_answer=str(e))
+            agent_run.run_log = log
+            if self.print_report:
+                RunLogger.print_report(log)
+            return agent_run
+
         except Exception as e:
             log = logger.finish(success=False, final_answer=str(e))
             agent_run.run_log = log
@@ -317,7 +319,6 @@ class SelfHealingAgent:
     # ── Private ────────────────────────────────────────────────────────────────
 
     def _execute(self, tool_name: str, tool_input: dict):
-        """Execute a tool, optionally routing execute_python through sandbox."""
         if self.enable_sandbox and tool_name == "execute_python":
             from .sandbox import execute_python_sandboxed
             return execute_python_sandboxed(tool_input["code"])
